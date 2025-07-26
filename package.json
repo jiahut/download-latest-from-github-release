@@ -1,0 +1,16 @@
+{
+  "name": "github-release-downloader",
+  "version": "1.0.0",
+  "description": "Download latest release from GitHub repositories with fuzzy matching",
+  "main": "download-latest.ts",
+  "scripts": {
+    "start": "bun download-latest.ts",
+    "test": "bun download-latest.ts https://github.com/oven-sh/bun --arch=darwin --type=.zip"
+  },
+  "keywords": ["github", "release", "download", "bun", "typescript"],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/bun": "latest"
+  }
+}
