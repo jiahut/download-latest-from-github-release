@@ -23,13 +23,11 @@ interface GitHubRelease {
 }
 
 interface MatchOptions {
-  arch?: string[];
-  fileTypes?: string[];
-  fileNames?: string[];
+  filters?: string[];
 }
 
 class GitHubReleaseDownloader {
-  private readonly defaultArch = ['x64', 'amd64', 'arm64', 'universal'];
+  private readonly defaultArch = ['x64', 'amd64', 'arm64', 'aarch64', 'x86_64', 'universal'];
   private readonly defaultFileTypes = ['.zip', '.tar.gz', '.exe', '.dmg', '.deb', '.rpm', '.AppImage'];
 
   async downloadLatest(
@@ -60,13 +58,12 @@ class GitHubReleaseDownloader {
       if (matchedAssets.length === 1) {
         await this.downloadAsset(matchedAssets[0], outputDir);
       } else {
-        console.log(`🎯 找到 ${matchedAssets.length} 个匹配文件:`);
-        matchedAssets.forEach((asset, index) => {
-          console.log(`  ${index + 1}. ${asset.name} (${this.formatSize(asset.size)})`);
-        });
-        
-        console.log('\n自动选择第一个文件进行下载...');
-        await this.downloadAsset(matchedAssets[0], outputDir);
+        const selectedAsset = await this.selectAsset(matchedAssets);
+        if (selectedAsset) {
+          await this.downloadAsset(selectedAsset, outputDir);
+        } else {
+          console.log('❌ 未选择任何文件，取消下载');
+        }
       }
     } catch (error) {
       console.error('❌ 下载失败:', error instanceof Error ? error.message : String(error));
@@ -102,23 +99,28 @@ class GitHubReleaseDownloader {
   }
 
   private filterAssets(assets: GitHubAsset[], options: MatchOptions): GitHubAsset[] {
-    const { arch = this.defaultArch, fileTypes = this.defaultFileTypes, fileNames = [] } = options;
+    const { filters = [] } = options;
     
+    // 如果没有筛选条件，使用默认筛选逻辑
+    if (filters.length === 0) {
+      return assets.filter(asset => {
+        const name = asset.name.toLowerCase();
+        
+        // 文件类型匹配
+        const typeMatch = this.defaultFileTypes.some(type => name.endsWith(type.toLowerCase()));
+        
+        // 架构匹配 - 如果文件名包含任一架构关键词则匹配，或者没有任何架构关键词也认为匹配
+        const hasArchKeyword = this.defaultArch.some(a => name.includes(a.toLowerCase()));
+        const archMatch = !hasArchKeyword || this.defaultArch.some(a => name.includes(a.toLowerCase()));
+        
+        return typeMatch && archMatch;
+      });
+    }
+    
+    // 有筛选条件时，文件名必须包含所有筛选条件
     return assets.filter(asset => {
       const name = asset.name.toLowerCase();
-      
-      // 文件类型匹配
-      const typeMatch = fileTypes.some(type => name.endsWith(type.toLowerCase()));
-      if (!typeMatch) return false;
-      
-      // 架构匹配
-      const archMatch = arch.some(a => name.includes(a.toLowerCase()));
-      
-      // 文件名模糊匹配
-      const nameMatch = fileNames.length === 0 || 
-        fileNames.some(pattern => name.includes(pattern.toLowerCase()));
-      
-      return archMatch && nameMatch;
+      return filters.every(filter => name.includes(filter.toLowerCase()));
     });
   }
 
@@ -153,6 +155,59 @@ class GitHubReleaseDownloader {
     return `${size.toFixed(1)} ${units[unitIndex]}`;
   }
 
+  private async selectAsset(assets: GitHubAsset[]): Promise<GitHubAsset | null> {
+    console.log(`🎯 找到 ${assets.length} 个匹配文件，使用 fzf 选择:`);
+    
+    // 创建选项列表，格式：文件名 (文件大小)
+    const options = assets.map(asset => 
+      `${asset.name} (${this.formatSize(asset.size)})`
+    );
+    
+    try {
+      // 使用 fzf 进行实时过滤选择
+      const proc = Bun.spawn([
+        'fzf', 
+        '--prompt=选择文件: ', 
+        '--height=40%',
+        '--reverse',
+        '--border'
+      ], {
+        stdin: 'pipe',
+        stdout: 'pipe',
+        stderr: 'inherit' // 让 fzf 的界面直接显示在终端
+      });
+      
+      // 将选项写入 fzf 的 stdin
+      proc.stdin.write(options.join('\n'));
+      proc.stdin.end();
+      
+      // 等待 fzf 完成并获取结果
+      await proc.exited;
+      
+      if (proc.exitCode !== 0) {
+        console.log('❌ 未选择任何文件，取消下载');
+        return null;
+      }
+      
+      const output = await new Response(proc.stdout).text();
+      const selectedLine = output.trim();
+      
+      if (!selectedLine) {
+        return null;
+      }
+      
+      // 根据选择的行找到对应的资源
+      const selectedIndex = options.findIndex(option => option === selectedLine);
+      return selectedIndex >= 0 ? assets[selectedIndex] : null;
+      
+    } catch (error) {
+      console.error('❌ fzf 选择失败:', error);
+      console.log('💡 请确保系统已安装 fzf (brew install fzf 或 apt install fzf)');
+      return null;
+    }
+  }
+
+
   private listAvailableAssets(assets: GitHubAsset[]): void {
     console.log('\n📋 可用的文件列表:');
     assets.forEach((asset, index) => {
@@ -168,37 +223,26 @@ function parseArgs(): { repoUrl: string; options: MatchOptions; outputDir: strin
   if (args.length === 0) {
     console.log(`
 使用方法:
-  bun download-latest.ts <github-repo-url> [选项]
+  bun download-latest.ts <github-repo-url> [筛选条件...]
 
 示例:
   bun download-latest.ts https://github.com/microsoft/vscode
-  bun download-latest.ts https://github.com/denoland/deno --arch=arm64 --type=.zip
-  bun download-latest.ts github.com/user/repo --name=linux --output=./downloads
+  bun download-latest.ts https://github.com/denoland/deno arm64 .zip
+  bun download-latest.ts https://github.com/user/repo linux x64
+  bun download-latest.ts github.com/user/repo windows .exe
 
-选项:
-  --arch=<arch>      指定架构 (如: x64,arm64,universal)
-  --type=<types>     指定文件类型 (如: .zip,.tar.gz,.exe)
-  --name=<names>     指定文件名模糊匹配 (如: linux,windows)
-  --output=<dir>     指定输出目录 (默认: 当前目录)
+说明:
+  - 第一个参数必须是 GitHub 仓库地址
+  - 后续参数都作为筛选条件，文件名必须包含所有筛选条件
+  - 如果不提供筛选条件，会使用默认规则过滤常见的可执行文件
 `);
     process.exit(0);
   }
 
   const repoUrl = args[0];
-  const options: MatchOptions = {};
-  let outputDir = process.cwd();
-
-  args.slice(1).forEach(arg => {
-    if (arg.startsWith('--arch=')) {
-      options.arch = arg.split('=')[1].split(',');
-    } else if (arg.startsWith('--type=')) {
-      options.fileTypes = arg.split('=')[1].split(',');
-    } else if (arg.startsWith('--name=')) {
-      options.fileNames = arg.split('=')[1].split(',');
-    } else if (arg.startsWith('--output=')) {
-      outputDir = arg.split('=')[1];
-    }
-  });
+  const filters = args.slice(1);
+  const options: MatchOptions = { filters };
+  const outputDir = process.cwd();
 
   return { repoUrl, options, outputDir };
 }
